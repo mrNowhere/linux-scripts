@@ -1,0 +1,395 @@
+#!/bin/bash 
+#!/usr/bin/expect 
+
+# Author: R.Kovrikov
+
+USER=""
+if [ ! -f "ip-list.txt" ];then
+	echo "ERROR: $(basename $0): no ip-list.txt" >&2; exit 1
+fi
+IP_LIST=$(cat ip-list.txt)
+touch err.log
+
+trap ex 2 3
+
+ex() {
+rm err.log tmp* 2>/dev/null
+echo
+exit 1
+}
+
+usage() {
+	echo "usage: $(basename $0) --ssh \"commands\" -f ip-list.txt"  
+	echo "usage: $(basename $0) --scp \"file1,file2\" -f ip-list.txt"  
+	exit 1
+}
+
+save_log() {
+	while read -p "Save error log? (yes/no) "; do
+		case $REPLY in
+		yes|YES|y) cp err.log err.log.$$
+			rm err.log 
+			break ;;
+		no|NO|n) rm err.log 
+			break ;;
+		*) echo "WARNING: usage only YES or NO" ;;
+		esac
+	done
+}
+
+err_msg(){
+	case $1 in
+		1) echo -e "\n$(basename $0): empty line" >&2; exit 1 ;;
+		2) echo -e "\n$(basename $0): bad password" >&2; exit 1;;
+		3) echo -e "\n$(basename $0): error while scp(ssh) session. Log:\n ----"
+		   cat $2
+		   echo "----"
+		   save_log
+	esac
+}
+
+
+get_passwd() {
+	read -t 60 -sp "enter password to unlock box: "
+	#echo ""
+	if [[ -z $REPLY ]]; then 
+		err_msg 1
+	fi
+	RES=$(cat passwd_encr | openssl enc -d -aes-256-cbc -k $REPLY 2>/dev/null)
+	if [[ $? -ne 0 ]]; then
+		err_msg 2
+	fi
+}
+
+
+ssh_start() {
+	if [[ ! $(type ssh 2>/dev/null ) ]]; then
+		echo "ERROR: ssh not install"
+		return 1
+	fi
+	declare -a COM
+	if [[ $# == 1 ]];then 
+		echo  "INFO: enter the commands like you doing this on remote console."
+		echo "INFO: enter \"exit\" to finish."
+		while true ; do
+			read -p "[root@]# "
+			if [ "$REPLY" == "exit" -a "${#COM[@]}" == "0" ]; then
+				EXIT="yes"
+				break
+			elif [ "$REPLY" == "exit" ]; then 
+				break
+			else COM+=("$REPLY;")
+			fi
+		done
+		if [[ "$EXIT" == "yes" ]]; then
+			return
+		fi
+	else COM+=($2)
+	fi
+	for I in $IP_LIST; do
+		I=$(echo $I | tr -d '\r')
+ 		expect -c " 
+  		log_file tmp.$$
+  		spawn ssh 
+  		expect { 
+   		*(yes/no)? { send \"yes\r\"; expect password:; send $1\r } 
+   		password: { send $1\r } 
+  		}
+		expect *#
+		send \"${COM[*]}\r\" 
+		sleep 2
+		send \"exit\r\"
+		expect eof " > /dev/null 2>&1  #  inside expect use * instead @
+		if [[ $(grep -E "No route|executing" tmp.$$) != "" ]]; then
+			cat tmp.$$ >> err.log
+			echo "ERROR:failed ssh: $I"
+		else echo "INFO: success ssh: $I"
+		fi
+		rm tmp.$$
+	done
+	if [[ -s err.log ]]; then
+		err_msg 3 err.log
+		echo "INFO: FAILED ssh"
+	else echo "INFO: SUCCESS ssh"
+	fi
+}
+
+
+scp_start(){
+	if [[ ! $(type scp 2>/dev/null ) ]]; then
+		echo "ERROR: scp not install"
+		return 1
+	fi
+	PTH=""
+	declare -a FILES
+	if [[ $# == 1 ]];then 
+		read -p "enter file(s): "
+		if [[ -z "$REPLY" ]]; then
+			echo "ERROR: no file(s) enter"; return
+		fi
+		for F in $REPLY; do 
+			if [[ -e "$F" ]]; then 
+				FILES+=(" "$F)
+			else echo "ERROR: no file in this path: $F"; 	
+			fi
+		done
+		ARRAY=$(echo ${FILES[@]})
+		C=$(echo ${#FILES[@]})
+		if [[ "$C" == 0 ]]; then
+			echo "ERROR: no file(s) enter"; return
+		fi
+		read -p "enter path: "
+		if [[ -z "$REPLY" ]]; then
+			echo "ERROR: no path enter."
+			read -p "WARNING: Use default path /root/ ?(yes/no). default [yes]: "
+			case ${REPLY:="yes"} in
+				yes|YES|y) PTH="" ;;
+				no|NO|n) return ;;
+				*) echo "WARNING: usage only YES or NO"; return ;; 
+			esac
+		else PTH=$REPLY
+		fi
+		echo "WARNING: Next file(s) [$ARRAY] will upload to remote host(s) path [$PTH] "
+		read -p "Continue?(yes/no). default [yes]: "
+			case ${REPLY:="yes"} in
+				yes|YES|y): ;;
+				no|NO|n) return ;;
+				*) echo "WARNING: Usage only YES or NO"; return ;; 
+			esac
+	else 
+		ARRAY=$2
+		C=$(echo $ARRAY | awk '{print NF}')
+	fi
+	for I in $IP_LIST; do 
+		I=$(echo $I | tr -d '\r')
+ 		expect -c " 
+  		log_file tmp.$$
+  		spawn scp 	
+  		expect { 
+   		*(yes/no)? { send \"yes\r\"; expect password:; send $1\r } 
+   		password: { send $1\r } 
+  		}
+		for {set COUNT 0} {\$COUNT < $C} {incr COUNT} {
+			expect 100%
+		}
+  		sleep 3 " > /dev/null 2>&1 
+		if [[ $(grep -E "No route|executing" tmp.$$) != "" ]]; then
+			cat tmp.$$ >> err.log
+			echo "ERROR: failed copy: $I"
+		else echo "INFO: success copy: $I"
+		fi
+		rm tmp.$$
+	done
+	if [[ -s err.log ]]; then
+		err_msg 3 err.log
+		echo "INFO: FAILED copy"
+	else echo "INFO: SUCCESS copy"
+	fi
+	
+}
+
+cp_kernel_debug(){
+	if [[ ! -e ]] || [[ ! -e ]]; then
+		echo "ERROR: loader.rc not in this path"
+		return
+	fi
+	echo "WARNING: check that your ip-list do not contain NCC address"
+	echo  -e "1) Virtual\n2) Real "
+	read  -p "Virtual cgw or real?: "
+	case $REPLY in
+		1) cp loader.rc.vmware loader.rc ;;
+		2) cp loader.rc.origin loader.rc ;;
+		*) echo "WARNING: Usage only 1 or 2"; return ;; 
+	esac
+	echo "kernel debug will upload to the next cgw: "
+	echo "$IP_LIST"
+	read -p "Continue?(yes/no). default [yes]: "
+	case ${REPLY:="yes"} in
+		yes|YES|y): ;;
+		no|NO|n) return ;;
+		*) echo "WARNING: Usage only YES or NO"; return ;; 
+	esac
+	for I in $IP_LIST; do 
+		I=$(echo $I | tr -d '\r')
+ 		expect -c " 
+  		log_file tmp.$$
+  		spawn ssh 
+  		expect { 
+   		*(yes/no)? { send \"yes\r\"; expect password:; send $1\r } 
+   		password: { send $1\r } 
+  		}
+		expect *#
+		send \"mv \r\"
+		send \"exit\r\"
+		expect eof " > /dev/null 2>&1 
+		if [[ $(grep -E "No route|executing" tmp.$$) != "" ]]; then
+			cat tmp.$$ >> err.log
+			echo "ERROR: failed rename origin kernel: $I"
+		else echo "INFO: success rename origin kernel: $I"
+		fi
+		if [[ -s err.log ]]; then
+			err_msg 3 err.log
+			rm tmp.$$
+			return 1
+		fi
+ 		expect -c " 
+  		log_file tmp.$$
+  		spawn scp 
+  		expect { 
+   		*(yes/no)? { send \"yes\r\"; expect password:; send $1\r } 
+   		password: { send $1\r } 
+		}
+		expect 100%
+  		sleep 3 " > /dev/null 2>&1 
+		if [[ $(grep -E "No route|executing" tmp.$$) != "" ]]; then
+			cat tmp.$$ >> err.log
+			echo "ERROR: failed copy kernel: $I"
+		else echo "INFO: success copy kernel: $I"
+		fi
+		if [[ -s err.log ]]; then
+			err_msg 3 err.log
+			rm tmp.$$
+		else echo "INFO: SUCCESS copy kernel debug"
+		fi
+	done
+	rm loader.rc
+	
+	
+}
+
+reboot(){
+	echo "INFO: next cgw will be reboot: "
+	echo "$IP_LIST"
+	read -p "Continue?(yes/no). default [yes]: "
+	case ${REPLY:="yes"} in
+		yes|YES|y): ;;
+		no|NO|n) return ;;
+		*) echo "WARNING: Usage only YES or NO"; return ;; 
+	esac
+	for I in $IP_LIST; do 
+		I=$(echo $I | tr -d '\r')
+ 		expect -c " 
+  		log_file tmp.$$
+  		spawn ssh 
+  		expect { 
+   		*(yes/no)? { send \"yes\r\"; expect password:; send $1\r } 
+   		password: { send $1\r } 
+  		}
+		expect *#
+		send \"reboot\r\"
+		send \"exit\r\"
+		expect eof " > /dev/null 2>&1 
+		if [[ $(grep -E "no route|executing" tmp.$$) != "" ]]; then
+			cat tmp.$$ >> err.log
+			echo "ERROR: failed reboot: $I"
+		else echo "INFO: success reboot: $I"
+		fi
+		rm tmp.$$
+	done
+	if [[ -s err.log ]]; then
+		err_msg 3 err.log
+	else echo "INFO: SUCCESS reboot"
+	fi
+	
+}
+main() {
+	get_passwd
+	> err.log
+	clear	
+	while true; do
+		cat <<- EOF
+		Choose operation: 
+
+		1) SSH
+		2) SCP
+		3) Upload kernel debug
+		4) Reboot all
+		5) Quit
+		EOF
+		read -p "operation: "
+		if [[ $REPLY =~ ^[1-5]$ ]]; then
+			case $REPLY in
+				1) ssh_start $RES ;;
+				2) scp_start $RES ;;
+				3) cp_kernel_debug $RES;;
+				4) reboot $RES ;;
+				5) break ;;
+			esac
+			read -p "Continue program? (yes/no). default [yes]: "
+			case ${REPLY:="yes"} in
+				yes|YES|y) clear ;;
+				no|NO|n) break ;;
+				*) echo "WARNING: Usage only YES or NO"; sleep 2; clear ;;
+			esac
+		else echo "WARNING: Usage only 1-5"; sleep 2; clear
+		fi
+		
+	done
+	rm err.log 2> /dev/null
+	echo "Program terminated"
+	exit 0
+}
+
+if [ $# != 0 ]; then
+	TMP=""
+	OPT="no"
+	SERVICE=""
+	if [ $# == 1 ]; then	
+		usage
+	fi
+	while [ $# != 0 ]; do
+		case $1 in
+		--ssh) 	OPT="yes" 
+			SERVICE="ssh"
+			if [[ $2 =~ ^-f|^--scp|^-h|^--help ]]; then
+				usage
+			fi
+			TMP=$2 
+			shift ;;
+		--scp) 	OPT="yes" 
+			SERVICE="scp"
+			if [[ $2 =~ ^-f|^--scp|^-h|^--help ]]; then
+				usage
+			fi
+			TMP=$2 
+	       		shift ;;
+		-h|--help) echo "usage: $(basename $0) --[ssh|scp] \"commands\" -f ip-list.txt"  
+		  	  exit 0 ;;
+		-f) if [ -f $2 ] && [ "$2" == "ip-list.txt" ] && [ -n "$TMP" ]; then
+			IP_LIST=$(cat ip-list.txt)
+			shift
+		    else 
+			usage
+		    fi ;;
+		ip-list.txt) shift ;;
+		*) if [[ $2 =~ ^-f ]]; then shift 
+		   else 
+			usage
+		   fi ;;
+		esac
+	done
+	#a=$(echo $TMP | sed 's/[\;\/]//g') # remove spec simbols
+	#echo $TMP | grep -ob -E "(\;|\/)" # number of index contains char
+	if [ "$SERVICE" == "ssh" ]; then
+		get_passwd
+		ssh_start $RES "$TMP"
+		exit 0
+	elif [ "$SERVICE" == "scp" ]; then 
+		FILES=""
+		IFS=$','
+		for F in $TMP; do 
+			if [[ -e "$F" ]]; then 
+				FILES+=" $F"
+			else 
+				echo "ERROR: no file in this path: $F"
+			fi
+		done
+		if [[ -z $FILES ]];then exit 1
+		fi	
+		unset IFS
+		get_passwd
+		scp_start $RES "$FILES"
+		exit 0
+	fi
+fi
+main
